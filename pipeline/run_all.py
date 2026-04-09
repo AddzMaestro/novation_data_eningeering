@@ -30,7 +30,6 @@ def main():
     config = load_config()
 
     with log_stage(logger, "Full Pipeline"):
-        # Initialise shared SparkSession once
         get_or_create_spark(config)
 
         run_ingestion(config)

@@ -1,6 +1,30 @@
 """
 Gold layer: Join and aggregate Silver tables into the scored Kimball star schema.
 
+Input paths (Silver layer output — read these, do not modify):
+  /data/output/silver/accounts/
+  /data/output/silver/transactions/
+  /data/output/silver/customers/
+
+Output paths (your pipeline must create these directories):
+  /data/output/gold/fact_transactions/     — 15 fields (see output_schema_spec.md §2)
+  /data/output/gold/dim_accounts/          — 11 fields (see output_schema_spec.md §3)
+  /data/output/gold/dim_customers/         — 9 fields  (see output_schema_spec.md §4)
+
+Requirements:
+  - Generate surrogate keys (_sk fields) that are unique, non-null, and stable
+    across pipeline re-runs on the same input data. Use row_number() with a
+    stable ORDER BY on the natural key, or sha2(natural_key, 256) cast to BIGINT.
+  - Resolve all foreign key relationships:
+      fact_transactions.account_sk  → dim_accounts.account_sk
+      fact_transactions.customer_sk → dim_customers.customer_sk
+      dim_accounts.customer_id      → dim_customers.customer_id
+  - Rename accounts.customer_ref → dim_accounts.customer_id at this layer.
+  - Derive dim_customers.age_band from dob (do not copy dob directly).
+  - Write each table as a Delta Parquet table.
+  - Do not hardcode file paths — read from config/pipeline_config.yaml.
+  - At Stage 2, also write /data/output/dq_report.json summarising DQ outcomes.
+
 Produces:
   - dim_customers  (9 fields)  — with derived age_band from dob
   - dim_accounts   (11 fields) — customer_ref renamed to customer_id
@@ -71,8 +95,6 @@ def _build_dim_accounts(spark, silver_path, gold_path):
         spark.read.format("delta").load(f"{silver_path}/accounts")
         .withColumnRenamed("customer_ref", "customer_id")
         .transform(lambda d: _add_surrogate_key(d, "account_sk", "account_id"))
-        .withColumn("credit_limit", F.col("credit_limit").cast(DecimalType(18, 2)))
-        .withColumn("current_balance", F.col("current_balance").cast(DecimalType(18, 2)))
         .transform(enforce_schema(GOLD_DIM_ACCOUNTS_SCHEMA))
     )
     # Cache — consumed twice: write + fact join lookup
@@ -86,7 +108,6 @@ def _build_fact_transactions(spark, silver_path, gold_path, dim_accounts, dim_cu
     """Build fact_transactions: 15 fields with resolved surrogate keys."""
     txn = spark.read.format("delta").load(f"{silver_path}/transactions")
 
-    # Prepare lookup DataFrames for broadcast join
     acct_lookup = dim_accounts.select(
         F.col("account_id"),
         F.col("account_sk"),

@@ -32,10 +32,3 @@ stream/*.jsonl
 
 # Test artefacts
 .pytest_cache/
-tests/__pycache__/
-
-# Data files — never commit
-*.csv
-*.jsonl
-*.parquet
-test-data/

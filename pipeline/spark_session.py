@@ -1,7 +1,7 @@
 """
 Shared SparkSession factory and config loader.
 
-Single session shared across all pipeline layers — saves ~30s startup and ~500MB RAM.
+Single session shared across all pipeline layers — reduces startup time and RAM.
 Config loaded from YAML with env var override for path.
 Delta JARs pre-downloaded at Docker build time, loaded via spark.jars at runtime.
 """
