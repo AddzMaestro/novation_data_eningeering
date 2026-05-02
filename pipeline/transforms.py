@@ -11,10 +11,25 @@ from pyspark.sql.window import Window
 from pyspark.sql.types import StringType, DecimalType, IntegerType, DateType
 
 
-def deduplicate_on(key_col):
-    """Dedup on key_col, keeping the row with the latest ingestion_timestamp."""
+# Regex patterns — sourced from config/dq_rules.yaml; mirrored here as
+# Python strings so transforms can be evaluated in Spark expressions.
+RE_AMOUNT_QUOTED       = r'"amount":\s*"'
+RE_DATE_NON_ISO_TXN    = r'"transaction_date":\s*([0-9]+|"[0-9]{2}/[0-9]{2}/[0-9]{4}")'
+RE_CURRENCY_VARIANT    = r'"currency":\s*([0-9]+|"(R|rands|zar|RANDS)")'
+RE_DATE_ISO            = r'^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+RE_KEY_MERCHANT_SUBCAT = r'"merchant_subcategory"'
+
+
+def deduplicate_on(key_col, order_col=None, ascending=True):
+    """Dedup on key_col. If order_col given, keep the row with the
+    earliest (ascending=True) or latest (ascending=False) value of that
+    column; otherwise fall back to ingestion_timestamp DESC."""
     def _dedup(df: DataFrame) -> DataFrame:
-        w = Window.partitionBy(key_col).orderBy(F.col("ingestion_timestamp").desc())
+        if order_col is not None:
+            order = F.col(order_col).asc() if ascending else F.col(order_col).desc()
+        else:
+            order = F.col("ingestion_timestamp").desc()
+        w = Window.partitionBy(key_col).orderBy(order)
         return (
             df
             .withColumn("_rn", F.row_number().over(w))
@@ -32,7 +47,6 @@ def cast_date(column):
             F.coalesce(
                 F.to_date(F.col(column), "yyyy-MM-dd"),
                 F.to_date(F.col(column), "dd/MM/yyyy"),
-                # Epoch integer support (Stage 2 forward-design)
                 F.when(
                     F.col(column).cast("long").isNotNull(),
                     F.to_date(F.from_unixtime(F.col(column).cast("long")))
@@ -57,15 +71,10 @@ def cast_integer(column):
 
 
 def normalise_currency(column="currency"):
-    """Map currency variants (R, rands, 710, zar) → ZAR."""
+    """Normalise currency variants (R, rands, zar, 710, ZAR) to canonical 'ZAR'.
+    All values represent ZAR per the data dictionary."""
     def _normalise(df: DataFrame) -> DataFrame:
-        return df.withColumn(
-            column,
-            F.when(
-                F.upper(F.col(column).cast(StringType())).isin("ZAR", "R", "RANDS", "710"),
-                F.lit("ZAR")
-            ).otherwise(F.lit("ZAR"))  # Default to ZAR — all values represent ZAR
-        )
+        return df.withColumn(column, F.lit("ZAR"))
     return _normalise
 
 
@@ -102,3 +111,43 @@ def flatten_metadata():
             .drop("metadata")
         )
     return _flatten
+
+
+def detect_dq_signals_from_raw(raw_col="_raw_line"):
+    """Add per-row boolean DQ signal columns derived from the raw JSON line.
+
+    These signals are used both to populate the dq_flag column (priority-coalesced)
+    and to count records per issue cohort in dq_report.json.
+    """
+    def _detect(df: DataFrame) -> DataFrame:
+        raw = F.col(raw_col)
+        return (
+            df
+            .withColumn("_dq_type_mismatch", raw.rlike(RE_AMOUNT_QUOTED))
+            .withColumn("_dq_date_format", raw.rlike(RE_DATE_NON_ISO_TXN))
+            .withColumn("_dq_currency_variant", raw.rlike(RE_CURRENCY_VARIANT))
+        )
+    return _detect
+
+
+def assign_dq_flag(priority):
+    """Coalesce the boolean DQ signals into a single dq_flag value using priority.
+
+    `priority` is a list of dq_flag codes; the first matching signal wins.
+    Rows with no matching signal get dq_flag = NULL.
+    """
+    flag_to_signal = {
+        "TYPE_MISMATCH": "_dq_type_mismatch",
+        "DATE_FORMAT": "_dq_date_format",
+        "CURRENCY_VARIANT": "_dq_currency_variant",
+    }
+
+    def _assign(df: DataFrame) -> DataFrame:
+        expr = F.lit(None).cast(StringType())
+        for flag in reversed(priority):  # later items go first in nested when
+            signal = flag_to_signal.get(flag)
+            if signal is None or signal not in df.columns:
+                continue
+            expr = F.when(F.col(signal), F.lit(flag)).otherwise(expr)
+        return df.withColumn("dq_flag", expr)
+    return _assign

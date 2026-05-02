@@ -1,76 +1,148 @@
 # ============================================================
-# Data Quality Rules
+# Data Quality Rules — Stage 2
 #
-# This file is REQUIRED from Stage 2 onward.
-# The scoring system checks that your pipeline reads DQ logic
-# from this file rather than hardcoding it in Python.
+# Each rule defines, for one of the six DQ issue categories:
+#   - detection      → how the pipeline identifies the issue
+#   - handling       → what the pipeline does with affected records
+#   - dq_flag        → the value written to fact_transactions.dq_flag
+#                      (null for issues handled outside the fact table —
+#                       e.g. dedup drops, null-PK exclusions, orphan quarantines)
 #
-# Populate this file with the rules your transform.py applies
-# to flag records in the transactions Silver/Gold tables.
+# The pipeline (pipeline/dq_rules.py) loads this file once at startup. The
+# `handling.action` values surface in /data/output/dq_report.json. The
+# evaluation system cross-references these strings against the report, so
+# the values here are the source of truth.
 #
-# Structure is flexible — design it to suit your implementation.
-# The example skeleton below shows one common pattern.
+# Allowed handling.action values (per dq_report_template.json):
+#   DEDUPLICATED_KEEP_FIRST, QUARANTINED, CAST_TO_DECIMAL,
+#   EXCLUDED_CAST_FAILED, NORMALISED_DATE, NORMALISED_CURRENCY,
+#   EXCLUDED_NULL_PK
+#
+# Allowed dq_flag values (per output_schema_spec.md §8 / Stage 2 addendum §3):
+#   DUPLICATE_DEDUPED, ORPHANED_ACCOUNT, TYPE_MISMATCH,
+#   DATE_FORMAT, CURRENCY_VARIANT, NULL_REQUIRED, null
 # ============================================================
 
-# ── Null checks ───────────────────────────────────────────────
-# Fields that must not be null. Records violating these rules
-# should receive dq_flag = "NULL_REQUIRED".
-#
-# null_checks:
-#   fact_transactions:
-#     - transaction_id
-#     - account_id
-#     - transaction_date
-#     - amount
-#     - transaction_type
-#     - currency
-#     - channel
+version: 2
+stage: 2
 
-# ── Type checks ───────────────────────────────────────────────
-# Fields with expected types. Records where values cannot be
-# cast should receive dq_flag = "TYPE_MISMATCH".
-#
-# type_checks:
-#   fact_transactions:
-#     amount: decimal
-#     transaction_date: date
-#     transaction_timestamp: timestamp
+# Priority order for fact_transactions.dq_flag when a single row exhibits
+# multiple issues. First match wins. Issues handled outside fact_transactions
+# (DUPLICATE_DEDUPED → drop, ORPHANED_ACCOUNT → quarantine, NULL_REQUIRED →
+# quarantine) are excluded from this list.
+dq_flag_priority:
+  - TYPE_MISMATCH
+  - DATE_FORMAT
+  - CURRENCY_VARIANT
 
-# ── Value domain checks ───────────────────────────────────────
-# Fields constrained to a fixed set of values.
-#
-# domain_checks:
-#   transaction_type:
-#     allowed: [DEBIT, CREDIT, FEE, REVERSAL]
-#     dq_flag: TYPE_MISMATCH
-#   channel:
-#     allowed: [POS, APP, ATM, EFT, USSD, INTERNAL]
-#     dq_flag: TYPE_MISMATCH
+issues:
 
-# ── Currency normalisation ────────────────────────────────────
-# Source data may contain currency variants. All values must be
-# standardised to "ZAR" in the Gold output. Records with
-# non-standard source values should receive dq_flag = "CURRENCY_VARIANT".
-#
-# currency_normalisation:
-#   target_value: ZAR
-#   flag_variants: true
+  duplicate_transactions:
+    description: >
+      Duplicate transaction events with identical transaction_id but marginally
+      different transaction_time values (double-delivery). Keep the earliest
+      delivered copy; drop the rest.
+    affected_files: [transactions.jsonl]
+    detection:
+      method: groupby_count
+      partition_key: transaction_id
+      condition: count_per_key > 1
+    handling:
+      action: DEDUPLICATED_KEEP_FIRST
+      order_by: transaction_time
+      ascending: true
+    dq_flag: null
 
-# ── Date format checks ────────────────────────────────────────
-# Date fields must conform to ISO format (YYYY-MM-DD).
-# Records with unrecognised date formats should receive
-# dq_flag = "DATE_FORMAT".
-#
-# date_format_checks:
-#   - transaction_date
-#   - last_activity_date
+  orphaned_transactions:
+    description: >
+      Transactions referencing an account_id with no matching record in
+      accounts.csv. Quarantined — excluded from Silver/Gold.
+    affected_files: [transactions.jsonl]
+    detection:
+      method: anti_join
+      field: account_id
+      references: accounts.account_id
+    handling:
+      action: QUARANTINED
+      quarantine_path: silver/_quarantine/transactions_orphan
+    dq_flag: ORPHANED_ACCOUNT
 
-# ── Referential integrity checks ─────────────────────────────
-# Transactions referencing an account_id not present in
-# dim_accounts should receive dq_flag = "ORPHANED_ACCOUNT".
-#
-# referential_integrity:
-#   fact_transactions:
-#     - field: account_id
-#       references: dim_accounts.account_id
-#       dq_flag: ORPHANED_ACCOUNT
+  amount_type_mismatch:
+    description: >
+      The amount field arrives as a JSON string ("349.50") instead of a JSON
+      number (349.50). Detected via raw-line regex; cast to DECIMAL(18,2)
+      and retained where the cast succeeds.
+    affected_files: [transactions.jsonl]
+    detection:
+      method: regex_on_raw
+      raw_field: _raw_line
+      pattern: '"amount":\s*"'
+    handling:
+      action: CAST_TO_DECIMAL
+    dq_flag: TYPE_MISMATCH
+
+  amount_cast_failed:
+    description: >
+      Subset of amount_type_mismatch rows whose quoted amount value is not a
+      valid decimal (e.g. "ABC", malformed numeric). The cast yields NULL;
+      records are quarantined rather than allowed to enter Gold with NULL amount.
+    affected_files: [transactions.jsonl]
+    detection:
+      method: post_cast_null
+      field: amount
+      precondition: _dq_type_mismatch == true
+    handling:
+      action: EXCLUDED_CAST_FAILED
+      quarantine_path: silver/_quarantine/transactions_cast_failed
+    dq_flag: null
+
+  date_format_inconsistency:
+    description: >
+      Date fields contain a mix of ISO YYYY-MM-DD, DD/MM/YYYY and Unix epoch
+      integers. Normalised to ISO DATE in Silver. Counted across all three
+      source files.
+    affected_files: [transactions.jsonl, accounts.csv, customers.csv]
+    detection:
+      transactions:
+        method: regex_on_raw
+        raw_field: _raw_line
+        pattern: '"transaction_date":\s*([0-9]+|"[0-9]{2}/[0-9]{2}/[0-9]{4}")'
+      accounts:
+        method: regex_invert_on_field
+        field: open_date
+        iso_pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      customers:
+        method: regex_invert_on_field
+        field: dob
+        iso_pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+    handling:
+      action: NORMALISED_DATE
+      formats: [yyyy-MM-dd, dd/MM/yyyy, epoch_seconds]
+    dq_flag: DATE_FORMAT
+
+  currency_variants:
+    description: >
+      The currency field contains non-standard ZAR representations
+      (R, rands, zar lowercase, 710 ISO 4217 numeric). Standardised to "ZAR".
+    affected_files: [transactions.jsonl]
+    detection:
+      method: regex_on_raw
+      raw_field: _raw_line
+      pattern: '"currency":\s*([0-9]+|"(R|rands|zar|RANDS)")'
+    handling:
+      action: NORMALISED_CURRENCY
+      target_value: ZAR
+    dq_flag: CURRENCY_VARIANT
+
+  null_account_id:
+    description: >
+      account_id primary key is null or empty. Records have no valid identifier
+      and are routed to a quarantine table; excluded from Silver and Gold.
+    affected_files: [accounts.csv]
+    detection:
+      method: null_or_empty
+      field: account_id
+    handling:
+      action: EXCLUDED_NULL_PK
+      quarantine_path: silver/_quarantine/accounts_null_pk
+    dq_flag: NULL_REQUIRED

@@ -49,6 +49,16 @@ def get_or_create_spark(config=None):
     master = spark_config.get("master", "local[2]")
     app_name = spark_config.get("app_name", "nedbank-de-pipeline")
 
+    # Redirect Spark scratch off the 512MB /tmp tmpfs (scoring system grants
+    # `--tmpfs /tmp:rw,size=512m`) onto the host-backed /data/output mount,
+    # which has the full host disk available. Without this, shuffle for the
+    # 3M-row transactions dedup overflows tmpfs with "No space left on
+    # device". /data/output is writable per the scoring contract.
+    output_root = config.get("output", {}).get("silver_path", "/data/output/silver")
+    output_root = output_root.rsplit("/silver", 1)[0] if "/silver" in output_root else "/data/output"
+    spark_local_dir = f"{output_root}/.spark_scratch"
+    os.makedirs(spark_local_dir, exist_ok=True)
+
     jar_path, packages = _resolve_delta_jars()
 
     builder = (
@@ -58,6 +68,8 @@ def get_or_create_spark(config=None):
         # Memory — tight budget for 2GB container
         .config("spark.driver.memory", "1g")
         .config("spark.executor.memory", "512m")
+        # Scratch — off /tmp (512MB tmpfs) onto /data/output (host-backed)
+        .config("spark.local.dir", spark_local_dir)
         # Parallelism — match 2 vCPU constraint
         .config("spark.sql.shuffle.partitions", "4")
         .config("spark.default.parallelism", "2")

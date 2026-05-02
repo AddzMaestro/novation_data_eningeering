@@ -1,14 +1,75 @@
 """
 Schema contracts for all pipeline layers.
 
-Defines exact StructTypes for Gold tables matching output_schema_spec.md.
-Enforced at write boundaries only — zero extra materialisation cost.
+Source schemas pin Bronze ingestion (defeats Spark's inference heuristics on
+mixed-type JSON fields like Stage 2's `amount`, `currency`, `transaction_date`).
+Gold schemas match output_schema_spec.md and are enforced at write boundary only.
 """
 
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, IntegerType,
     DateType, TimestampType, DecimalType, BooleanType
 )
+
+
+# ─── Source Schemas (pinned at Bronze read; all StringType — defer parsing to Silver) ────────
+
+SOURCE_CUSTOMERS_SCHEMA = StructType([
+    StructField("customer_id", StringType(), nullable=True),
+    StructField("id_number", StringType(), nullable=True),
+    StructField("first_name", StringType(), nullable=True),
+    StructField("last_name", StringType(), nullable=True),
+    StructField("dob", StringType(), nullable=True),
+    StructField("gender", StringType(), nullable=True),
+    StructField("province", StringType(), nullable=True),
+    StructField("income_band", StringType(), nullable=True),
+    StructField("segment", StringType(), nullable=True),
+    StructField("risk_score", StringType(), nullable=True),
+    StructField("kyc_status", StringType(), nullable=True),
+    StructField("product_flags", StringType(), nullable=True),
+])  # 12 fields
+
+SOURCE_ACCOUNTS_SCHEMA = StructType([
+    StructField("account_id", StringType(), nullable=True),
+    StructField("customer_ref", StringType(), nullable=True),
+    StructField("account_type", StringType(), nullable=True),
+    StructField("account_status", StringType(), nullable=True),
+    StructField("open_date", StringType(), nullable=True),
+    StructField("product_tier", StringType(), nullable=True),
+    StructField("mobile_number", StringType(), nullable=True),
+    StructField("digital_channel", StringType(), nullable=True),
+    StructField("credit_limit", StringType(), nullable=True),
+    StructField("current_balance", StringType(), nullable=True),
+    StructField("last_activity_date", StringType(), nullable=True),
+])  # 11 fields
+
+# Transactions: ALL fields read as String (incl. nested), so JSON numbers vs
+# strings collapse to one type. The _raw_line column is preserved at Bronze
+# so Silver can regex-detect the original JSON token type for DQ flagging
+# (TYPE_MISMATCH = amount was quoted; CURRENCY_VARIANT = currency was number;
+# DATE_FORMAT = transaction_date was unquoted epoch).
+SOURCE_TRANSACTIONS_SCHEMA = StructType([
+    StructField("transaction_id", StringType(), nullable=True),
+    StructField("account_id", StringType(), nullable=True),
+    StructField("transaction_date", StringType(), nullable=True),
+    StructField("transaction_time", StringType(), nullable=True),
+    StructField("transaction_type", StringType(), nullable=True),
+    StructField("merchant_category", StringType(), nullable=True),
+    StructField("amount", StringType(), nullable=True),
+    StructField("currency", StringType(), nullable=True),
+    StructField("channel", StringType(), nullable=True),
+    StructField("location", StructType([
+        StructField("province", StringType(), nullable=True),
+        StructField("city", StringType(), nullable=True),
+        StructField("coordinates", StringType(), nullable=True),
+    ]), nullable=True),
+    StructField("metadata", StructType([
+        StructField("device_id", StringType(), nullable=True),
+        StructField("session_id", StringType(), nullable=True),
+        StructField("retry_flag", StringType(), nullable=True),
+    ]), nullable=True),
+    StructField("merchant_subcategory", StringType(), nullable=True),
+])  # 13 top-level fields
 
 
 # ─── Gold Layer Schemas (exact field order per output_schema_spec.md) ────────
