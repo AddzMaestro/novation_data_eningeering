@@ -1,13 +1,16 @@
 """
 Pipeline entry point.
 
-Stage 2 orchestration:
+Stage 2 batch orchestration:
   1. Ingest    — raw → Bronze Delta
   2. Collect bronze metrics (single agg pass; feeds dq_report.json)
   3. Transform — Bronze → Silver Delta + quarantine tables
   4. Collect silver metrics (records_in_output per issue cohort)
   5. Provision — Silver → Gold Delta
   6. Collect gold record counts + write /data/output/dq_report.json
+
+Stage 3 streaming extension (runs after batch in the same container):
+  7. Stream ingest — poll /data/stream/, MERGE into stream_gold/
 
 The scoring system invokes this file directly:
   docker run ... python pipeline/run_all.py
@@ -34,6 +37,7 @@ from pipeline.dq_metrics import (
     collect_cast_failed_count,
 )
 from pipeline.dq_report import build_dq_report, write_dq_report
+from pipeline.stream_ingest import run_stream_ingestion
 
 
 logger = setup_logger()
@@ -94,6 +98,12 @@ def main():
             )
             write_dq_report(report, dq_report_path)
             logger.info(f"  dq_report: wrote to {dq_report_path}")
+
+        # Stage 3 — streaming extension (only runs if streaming config present).
+        # Reuses the same SparkSession the batch stages built. Quiesces on its
+        # own when no new files arrive for `quiesce_timeout_seconds`.
+        if "streaming" in config:
+            run_stream_ingestion(config)
 
     stop_spark()
     logger.info("Pipeline complete — exit 0")
